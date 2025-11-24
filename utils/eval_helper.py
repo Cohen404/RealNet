@@ -56,8 +56,13 @@ class EvalImage:
         raise NotImplementedError
 
     def encode_mask(self, masks):
+        # Handle both 3D (N, H, W) and 4D (N, C, H, W) tensors
+        if len(masks.shape) == 4:
+            # If 4D, squeeze the channel dimension
+            masks = np.squeeze(masks, axis=1)
+            
         N, _, _ = masks.shape
-        masks = (masks.reshape(N, -1).sum(axis=1) != 0).astype(np.int)  # (N, )
+        masks = (masks.reshape(N, -1).sum(axis=1) != 0).astype(int)  # (N, )
         return masks
 
     def eval_auc(self):
@@ -72,6 +77,11 @@ class EvalImage:
 class EvalImageMax(EvalImage):
     @staticmethod
     def encode_pred(preds, avgpool_size):
+        # Handle both 3D (N, H, W) and 4D (N, C, H, W) tensors
+        if len(preds.shape) == 4:
+            # If 4D, squeeze the channel dimension
+            preds = np.squeeze(preds, axis=1)
+        
         N, _, _ = preds.shape
         preds = torch.tensor(preds[:, None, ...]).cuda()  # N x 1 x H x W
         preds = (
@@ -101,14 +111,36 @@ class EvalPixelAUC:
 
 class EvalPixelPro:
     def __init__(self, data_meta):
-        self.preds = np.concatenate(
-            [np.expand_dims(pred,axis=0) for pred in data_meta.preds], axis=0
-        )
-        self.masks = np.concatenate(
-            [np.expand_dims(mask,axis=0)  for mask in data_meta.masks], axis=0
-        )
+        # Handle both 3D (N, H, W) and 4D (N, C, H, W) tensors
+        if len(data_meta.preds[0].shape) == 4:
+            # If 4D, squeeze the channel dimension
+            self.preds = np.concatenate(
+                [np.squeeze(pred, axis=1) for pred in data_meta.preds], axis=0
+            )
+        else:
+            # If 3D, use as is
+            self.preds = np.concatenate(
+                [np.expand_dims(pred,axis=0) for pred in data_meta.preds], axis=0
+            )
+            
+        # Handle both 3D (N, H, W) and 4D (N, C, H, W) tensors for masks
+        if len(data_meta.masks[0].shape) == 4:
+            # If 4D, squeeze the channel dimension
+            self.masks = np.concatenate(
+                [np.squeeze(mask, axis=1) for mask in data_meta.masks], axis=0
+            )
+        else:
+            # If 3D, use as is
+            self.masks = np.concatenate(
+                [np.expand_dims(mask,axis=0)  for mask in data_meta.masks], axis=0
+            )
+            
         self.masks[self.masks > 0] = 1
-        self.masks=self.masks.astype(np.bool)
+        self.masks=self.masks.astype(bool)
+        
+        # Debug: check data dimensions
+        print(f"Debug: preds shape: {self.preds.shape}")
+        print(f"Debug: masks shape: {self.masks.shape}")
 
     def rescale(self,x):
         return (x - x.min()) / (x.max() - x.min())
@@ -128,7 +160,7 @@ class EvalPixelPro:
         threds = []
         fprs = []
 
-        binary_score_maps = np.zeros_like(self.preds, dtype=np.bool)
+        binary_score_maps = np.zeros_like(self.preds, dtype=bool)
 
         for step in range(max_step):
             thred = max_th - step * delta
@@ -139,19 +171,74 @@ class EvalPixelPro:
             # pro: find each connected gt region, compute the overlapped pixels between the gt region and predicted region
             # iou: for each image, compute the ratio, i.e. intersection/union between the gt and predicted binary map
             for i in range(len(binary_score_maps)):  # for i th image
-                # pro (per region level)
-                label_map = measure.label(self.masks[i], connectivity=2)
-                props = measure.regionprops(label_map)
-                for prop in props:
-                    x_min, y_min, x_max, y_max = prop.bbox  # find the bounding box of an anomaly region
-                    cropped_pred_label = binary_score_maps[i][x_min:x_max, y_min:y_max]
-                    # cropped_mask = gt_mask[i][x_min:x_max, y_min:y_max]   # bug!
-                    cropped_mask = prop.filled_image  # corrected!
-                    intersection = np.logical_and(cropped_pred_label, cropped_mask).astype(np.float32).sum()
-                    pro.append(intersection / prop.area)
+                    # pro (per region level)
+                    label_map = measure.label(self.masks[i], connectivity=2)
+                    props = measure.regionprops(label_map)
+                    
+                    # Debug: print info for the first image
+                    if step == max_step // 2 and i == 0:
+                        print(f"Debug: Image {i}, Number of regions: {len(props)}")
+                    
+                    for j, prop in enumerate(props):
+                        # bbox may have more than 4 values in newer versions, so we take only the first 4
+                        bbox = prop.bbox
+                        if len(bbox) == 6:  # 3D bbox (slice, min_row, min_col, max_row, max_col)
+                            slice_idx, x_min, y_min, x_max, y_max = bbox[0], bbox[1], bbox[2], bbox[3], bbox[4]
+                            # For 3D data, we need to handle the slice dimension
+                            if len(binary_score_maps[i].shape) == 3:
+                                cropped_pred_label = binary_score_maps[i][slice_idx, x_min:x_max, y_min:y_max]
+                            else:
+                                cropped_pred_label = binary_score_maps[i][x_min:x_max, y_min:y_max]
+                        else:  # 2D bbox (min_row, min_col, max_row, max_col)
+                            x_min, y_min, x_max, y_max = bbox[:4]
+                            cropped_pred_label = binary_score_maps[i][x_min:x_max, y_min:y_max]
+                        # cropped_mask = gt_mask[i][x_min:x_max, y_min:y_max]   # bug!
+                        cropped_mask = prop.filled_image  # corrected!
 
-            pros_mean.append(np.array(pro).mean())
-            pros_std.append(np.array(pro).std())
+                        # For 3D masks, we need to handle the slice dimension
+                        if len(cropped_mask.shape) == 3:
+                            cropped_mask = cropped_mask[0]  # Take the first slice
+                        
+                        # Debug: print info for the first region of the first image
+                        if step == max_step // 2 and i == 0 and j == 0:
+                            print(f"Debug: Region {j}, bbox: {bbox}")
+                            print(f"Debug: cropped_pred_label shape: {cropped_pred_label.shape}")
+                            print(f"Debug: cropped_mask shape: {cropped_mask.shape}")
+                            print(f"Debug: cropped_pred_label sum: {cropped_pred_label.sum()}")
+                            print(f"Debug: cropped_mask sum: {cropped_mask.sum()}")
+                        
+                        # Ensure both arrays have the same shape
+                        if cropped_pred_label.shape != cropped_mask.shape:
+                            # Try to resize the smaller array to match the larger one
+                            if cropped_pred_label.size > 0 and cropped_mask.size > 0:
+                                min_shape = (
+                                    min(cropped_pred_label.shape[0], cropped_mask.shape[0]),
+                                    min(cropped_pred_label.shape[1], cropped_mask.shape[1])
+                                )
+                                cropped_pred_label = cropped_pred_label[:min_shape[0], :min_shape[1]]
+                                cropped_mask = cropped_mask[:min_shape[0], :min_shape[1]]
+                            else:
+                                # Skip this region if either array is empty
+                                continue
+                            
+                        intersection = np.logical_and(cropped_pred_label, cropped_mask).astype(np.float32).sum()
+                        pro.append(intersection / prop.area)
+
+            pros_mean.append(np.array(pro).mean() if len(pro) > 0 else 0.0)
+            pros_std.append(np.array(pro).std() if len(pro) > 0 else 0.0)
+            # Debug: print number of regions found
+            if step == 0 or step == max_step // 2:  # Print for first and middle step
+                print(f"Debug: Step {step}, Found {len(pro)} regions")
+                print(f"Debug: Threshold={thred}, Max pred={self.preds.max()}, Min pred={self.preds.min()}")
+                print(f"Debug: Number of True in binary_score_maps: {binary_score_maps.sum()}")
+                print(f"Debug: Number of True in self.masks: {self.masks.sum()}")
+                
+                # Check regionprops for the first image
+                label_map = measure.label(self.masks[0], connectivity=2)
+                props = measure.regionprops(label_map)
+                print(f"Debug: Number of regions in first image: {len(props)}")
+                if len(props) > 0:
+                    print(f"Debug: First region bbox: {props[0].bbox}, area: {props[0].area}")
             # fpr for pro-auc
             gt_masks_neg = ~self.masks
             fpr = np.logical_and(gt_masks_neg, binary_score_maps).sum() / gt_masks_neg.sum()

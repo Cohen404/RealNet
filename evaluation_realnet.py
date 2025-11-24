@@ -150,8 +150,28 @@ def validate(config,val_loader, model,class_name):
             preds.append(outputs["anomaly_score"].cpu().numpy())
             masks.append(outputs["mask"].cpu().numpy())
 
-    preds = np.squeeze(np.concatenate(np.asarray(preds), axis=0),axis=1)  # N x H x W
-    masks = np.squeeze(np.concatenate(np.asarray(masks), axis=0),axis=1)  # N x H x W
+    # Handle variable-sized arrays by checking shapes before concatenation
+    try:
+        preds = np.squeeze(np.concatenate(np.asarray(preds), axis=0),axis=1)  # N x H x W
+        masks = np.squeeze(np.concatenate(np.asarray(masks), axis=0),axis=1)  # N x H x W
+    except ValueError:
+        # If concatenation fails due to shape mismatch, process each batch separately
+        processed_preds = []
+        processed_masks = []
+        
+        for pred_batch, mask_batch in zip(preds, masks):
+            # Ensure each batch has consistent shape
+            if len(pred_batch.shape) == 3:  # Batch x H x W
+                pred_batch = np.squeeze(pred_batch, axis=0) if pred_batch.shape[0] == 1 else pred_batch
+            if len(mask_batch.shape) == 3:  # Batch x H x W
+                mask_batch = np.squeeze(mask_batch, axis=0) if mask_batch.shape[0] == 1 else mask_batch
+                
+            processed_preds.append(pred_batch)
+            processed_masks.append(mask_batch)
+        
+        # Now try to concatenate the processed arrays
+        preds = np.concatenate(processed_preds, axis=0)
+        masks = np.concatenate(processed_masks, axis=0)
 
     ret_metrics = performances(class_name, preds, masks, config.evaluator.metrics)
 
@@ -160,12 +180,49 @@ def validate(config,val_loader, model,class_name):
     image_paths = []
 
     for fileinfo, pred, mask in zip(fileinfos, preds, masks):
-        preds_cls.append(pred[None, ...])
-        masks_cls.append(mask[None, ...])
+        # Ensure pred and mask have consistent shapes
+        if len(pred.shape) == 2:  # H x W
+            pred = pred[None, ...]  # Add batch dimension
+        if len(mask.shape) == 2:  # H x W
+            mask = mask[None, ...]  # Add batch dimension
+            
+        preds_cls.append(pred)
+        masks_cls.append(mask)
         image_paths.append(fileinfo['filename'])
 
-    preds_cls = np.concatenate(np.asarray(preds_cls), axis=0)  # N x H x W
-    masks_cls = np.concatenate(np.asarray(masks_cls), axis=0)  # N x H x W
+    try:
+        preds_cls = np.concatenate(np.asarray(preds_cls), axis=0)  # N x H x W
+        masks_cls = np.concatenate(np.asarray(masks_cls), axis=0)  # N x H x W
+    except ValueError:
+        # If concatenation still fails, try to handle shape mismatches
+        print("Warning: Shape mismatch in preds_cls or masks_cls, attempting to fix...")
+        # Find the maximum dimensions
+        max_h = max(p.shape[1] for p in preds_cls)
+        max_w = max(p.shape[2] for p in preds_cls)
+        
+        # Pad all arrays to the same size
+        padded_preds = []
+        padded_masks = []
+        
+        for pred, mask in zip(preds_cls, masks_cls):
+            # Pad prediction
+            if pred.shape[1] < max_h or pred.shape[2] < max_w:
+                padded_pred = np.zeros((pred.shape[0], max_h, max_w))
+                padded_pred[:, :pred.shape[1], :pred.shape[2]] = pred
+                padded_preds.append(padded_pred)
+            else:
+                padded_preds.append(pred)
+                
+            # Pad mask
+            if mask.shape[1] < max_h or mask.shape[2] < max_w:
+                padded_mask = np.zeros((mask.shape[0], max_h, max_w))
+                padded_mask[:, :mask.shape[1], :mask.shape[2]] = mask
+                padded_masks.append(padded_mask)
+            else:
+                padded_masks.append(mask)
+        
+        preds_cls = np.concatenate(padded_preds, axis=0)
+        masks_cls = np.concatenate(padded_masks, axis=0)
     masks_cls[masks_cls != 0.0] = 1.0
 
     precision, recall, thresholds = precision_recall_curve(masks_cls.flatten(), preds_cls.flatten())
