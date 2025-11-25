@@ -73,3 +73,11 @@ class ModelHelper(nn.Module):
             else:
                 module.train(mode)
         return self
+    
+    @property
+    def afs_module(self):
+        """Get the AFS module if it exists"""
+        for name, module in self.named_children():
+            if 'afs' in name.lower():
+                return module
+        return None

@@ -95,7 +95,7 @@ net:
       backbone: wide_resnet50_2
 
   - name: afs
-    type: models.afs.AFS
+    type: models.afs.RLAFS
     frozen: True
     prev: backbone
     kwargs:

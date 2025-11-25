@@ -1,0 +1,29 @@
+# RL Configuration for RealNet Feature Selection
+
+# PPO hyperparameters
+ppo:
+  lr: 0.001
+  gamma: 0.99
+  eps_clip: 0.2
+  k_epochs: 4
+  entropy_coef: 0.01
+  value_coef: 0.5
+  
+# Reward function weights
+reward:
+  alpha: 1.0  # Weight for PixelAUC improvement
+  beta: 0.5   # Weight for ImageAUC improvement
+  gamma: 0.1  # Weight for channel selection penalty
+  
+# RL training parameters
+training:
+  update_every_n_epochs: 5
+  batch_size: 32
+  max_timesteps: 1000
+  
+# Feature selection parameters
+feature_selection:
+  min_channels: 1
+  max_channels_ratio: 0.8
+  dynamic_inference: true  # Enable dynamic feature selection during inference
+  selection_strategy: "top_k"  # "top_k", "threshold", or "adaptive"
