@@ -192,33 +192,56 @@ class RLAFS(nn.Module):
                 self._current_selection[block_name] = current_selection
                 selected_mask[current_selection] = True
                 
-                # Apply selection to each layer
+                # Apply selection to each layer, but keep channel dimension
+                # consistent with the configured planes so that downstream
+                # modules (e.g., recon) see a fixed number of channels.
                 offset = 0
                 for i, layer in enumerate(block['layers']):
                     # Use actual channel count from the feature tensor
-                    actual_layer_planes = block_layer_feats[i].size(1)
+                    layer_feat = block_layer_feats[i]
+                    actual_layer_planes = layer_feat.size(1)
                     configured_layer_planes = layer['planes']
-                    
+
                     # Get mask for this layer based on configured planes
-                    layer_mask = selected_mask[offset:offset+configured_layer_planes]
+                    layer_mask = selected_mask[offset:offset + configured_layer_planes]
                     layer_indices = np.where(layer_mask)[0]
-                    
+
                     # Convert back to layer-relative indices
                     layer_relative_indices = [idx - offset for idx in layer_indices]
-                    
+
                     # Ensure indices are within the actual channel range
                     valid_indices = [idx for idx in layer_relative_indices if idx < actual_layer_planes]
-                    
-                    # Select channels
+
+                    # Upsample full feature map first
+                    upsample = getattr(self, "{}_{}_upsample".format(block_name, layer['idx']))
+                    layer_feat_up = upsample(layer_feat)
+
+                    # Prepare output tensor with fixed channel size
+                    B, C_up, H_up, W_up = layer_feat_up.shape
+                    feat_c = torch.zeros(
+                        B,
+                        configured_layer_planes,
+                        H_up,
+                        W_up,
+                        device=layer_feat_up.device,
+                        dtype=layer_feat_up.dtype,
+                    )
+
                     if valid_indices:
-                        feat_c = torch.index_select(block_layer_feats[i], 1, torch.tensor(valid_indices, device=block_layer_feats[i].device))
+                        # Copy selected channels to their original positions
+                        idx_tensor = torch.tensor(valid_indices, device=layer_feat_up.device)
+                        valid_in_feat = idx_tensor[idx_tensor < C_up]
+                        if valid_in_feat.numel() > 0:
+                            feat_c[:, valid_in_feat, :, :] = layer_feat_up[:, valid_in_feat, :, :]
                     else:
-                        # If no valid indices, select the first configured_layer_planes channels
-                        feat_c = block_layer_feats[i][:, :min(configured_layer_planes, actual_layer_planes), :, :]
-                    
-                    feat_c = getattr(self, "{}_{}_upsample".format(block_name, layer['idx']))(feat_c)
+                        # If no valid indices, fall back to first channels
+                        num_default = min(configured_layer_planes, C_up)
+                        if num_default > 0:
+                            default_idx = torch.arange(num_default, device=layer_feat_up.device)
+                            feat_c[:, default_idx, :, :] = layer_feat_up[:, default_idx, :, :]
+
                     block_feats[block_name].append(feat_c)
-                    
+
                     offset += configured_layer_planes
             else:
                 # Use fixed indices
@@ -411,19 +434,24 @@ class RLAFS(nn.Module):
 
     def update_rl(self, metrics, epoch):
         """
-        Update RL agents based on metrics
-        
-        Args:
-            metrics: Dictionary containing performance metrics
-            epoch: Current epoch
+        Update RL agents based on validation metrics.
+        使用验证阶段计算的 AUC 指标来更新每个 block 的 PPO 策略。
         """
-        if not self.rl_enabled or epoch < self.rl_config['training']['init_epochs']:
+        if not self.rl_enabled:
             return
-        
+
+        # 兼容不同的 RL 配置键名
+        training_cfg = self.rl_config.get('training', {})
+        init_epochs = training_cfg.get('init_epochs', 0)
+        update_freq = training_cfg.get('update_freq', training_cfg.get('update_every_n_epochs', 1))
+
+        if epoch < init_epochs:
+            return
+
         self.update_counter += 1
-        
+
         # Only update at specified frequency
-        if self.update_counter % self.rl_config['training']['update_freq'] != 0:
+        if self.update_counter % update_freq != 0:
             return
         
         # In distributed training, only update on rank 0 and then broadcast
@@ -437,16 +465,34 @@ class RLAFS(nn.Module):
         # Store selections to be synchronized
         selections_to_sync = {}
         
+        # 从整体指标中取出像素级 / 图像级 AUC（按需求 3）
+        # 优先使用 mean_*，其次使用当前类别的 AUC
+        mean_pixel_auc = metrics.get('mean_pixel_auc', None)
+        mean_image_auc = metrics.get('mean_image_auc', None)
+
+        # 如果没有 mean_*，尝试从任意 *_pixel_auc / *_image_auc 中取值
+        if mean_pixel_auc is None:
+            for k, v in metrics.items():
+                if k.endswith('_pixel_auc'):
+                    mean_pixel_auc = v
+                    break
+        if mean_image_auc is None:
+            for k, v in metrics.items():
+                if k.endswith('_image_auc'):
+                    mean_image_auc = v
+                    break
+
+        if mean_pixel_auc is None and mean_image_auc is None:
+            # 没有可用指标则不更新
+            return
+
         for block in self.structure:
             block_name = block['name']
-            
-            if block_name not in metrics:
-                continue
-                
+
             if should_update:
-                # Get current metrics
-                pixel_auc = metrics[block_name].get('pixel_auc', 0.0)
-                image_auc = metrics[block_name].get('image_auc', 0.0)
+                # 当前使用统一的整体指标更新每个 block 的策略
+                pixel_auc = mean_pixel_auc if mean_pixel_auc is not None else 0.0
+                image_auc = mean_image_auc if mean_image_auc is not None else 0.0
                 
                 # Get previous metrics
                 prev_pixel_auc = self.prev_metrics[block_name]['pixel_auc']
@@ -460,10 +506,10 @@ class RLAFS(nn.Module):
                 self.prev_metrics[block_name]['pixel_auc'] = pixel_auc
                 self.prev_metrics[block_name]['image_auc'] = image_auc
                 
-                # Get current selection
+                # Get current selection（基于索引参数还原 block 级通道选择）
                 current_selection = []
                 offset = 0  # Track offset for each layer
-                
+
                 for layer in block['layers']:
                     layer_name = "{}_{}".format(block_name, layer['idx'])
                     selected_indices = self.indexes[layer_name].data.tolist()
@@ -483,12 +529,31 @@ class RLAFS(nn.Module):
                 agent = self.rl_agents[block_name]
                 action, action_logprob = agent.select_action(state)
                 
-                # Calculate reward
+                # Calculate reward using:
+                # R = alpha * Δpixel_auc + beta * Δimage_auc
+                #     - lambda * ((N_curr - N_target) / N_target)^2
                 total_channels = sum([layer['planes'] for layer in block['layers']])
-                channel_penalty = len(current_selection) / total_channels
-                reward = (self.rl_config['reward']['alpha'] * delta_pixel_auc + 
-                         self.rl_config['reward']['beta'] * delta_image_auc - 
-                         self.rl_config['reward']['gamma'] * channel_penalty)
+
+                # 目标通道数与前向过程保持一致：优先使用已缓存的 target_channels，其次用 total_channels // 2
+                if hasattr(self, '_target_channels') and block_name in self._target_channels:
+                    target_channels = self._target_channels[block_name]
+                else:
+                    target_channels = min(total_channels // 2, total_channels)
+
+                target_channels = max(1, target_channels)  # 避免除零
+
+                N_curr = len(current_selection)
+                norm_diff = (N_curr - target_channels) / float(target_channels)
+
+                alpha = self.rl_config['reward'].get('alpha', 1.0)
+                beta = self.rl_config['reward'].get('beta', 0.5)
+                lambda_ = self.rl_config['reward'].get('gamma', 0.1)
+
+                reward = (
+                    alpha * delta_pixel_auc
+                    + beta * delta_image_auc
+                    - lambda_ * (norm_diff ** 2)
+                )
                 
                 # Take step in environment
                 next_state, _, _, _ = env.step(action, pixel_auc, image_auc)
@@ -509,12 +574,17 @@ class RLAFS(nn.Module):
         # Synchronize selections across all processes
         if hasattr(self, '_distributed') and self._distributed:
             import torch.distributed as dist
-            
-            # Convert selections to tensors for broadcasting
-            for block_name, selection in selections_to_sync.items():
-                selection_tensor = torch.tensor(selection, dtype=torch.long)
-                dist.broadcast(selection_tensor, src=0)
-                selections_to_sync[block_name] = selection_tensor.tolist()
+
+            # 如果实际上只有 1 个进程，就不需要做任何同步
+            world_size = dist.get_world_size()
+            if world_size > 1:
+                # Convert selections to tensors for broadcasting
+                for block_name, selection in selections_to_sync.items():
+                    # 使用与模块参数相同的 device，确保在 NCCL 后端下为 CUDA tensor
+                    device = next(self.parameters()).device
+                    selection_tensor = torch.tensor(selection, dtype=torch.long, device=device)
+                    dist.broadcast(selection_tensor, src=0)
+                    selections_to_sync[block_name] = selection_tensor.tolist()
             
             # Synchronize RL agent states
             if should_update:
@@ -523,41 +593,42 @@ class RLAFS(nn.Module):
                 rl_state = None
                 
             # Broadcast RL states from rank 0 to all processes
-            for block in self.structure:
-                block_name = block['name']
-                agent_key = f"{block_name}_agent"
-                
-                if should_update and agent_key in rl_state:
-                    # Get state dict for this agent
-                    agent_state = rl_state[agent_key]
-                    
-                    # Convert each tensor to a list for broadcasting
-                    broadcast_state = {}
-                    for key, value in agent_state.items():
-                        if isinstance(value, torch.Tensor):
-                            broadcast_state[key] = value
-                        else:
-                            # Handle non-tensor values (if any)
-                            broadcast_state[key] = value
-                    
-                    # Broadcast each tensor in the state
-                    for key, value in broadcast_state.items():
-                        if isinstance(value, torch.Tensor):
-                            dist.broadcast(value, src=0)
-                else:
-                    # Receive broadcasted state
-                    agent = self.rl_agents[block_name]
-                    agent_state = agent.state_dict()
-                    
-                    # Receive each tensor in the state
-                    for key in agent_state.keys():
-                        if isinstance(agent_state[key], torch.Tensor):
-                            received_tensor = torch.zeros_like(agent_state[key])
-                            dist.broadcast(received_tensor, src=0)
-                            agent_state[key] = received_tensor
-                    
-                    # Load the received state
-                    agent.load_state_dict(agent_state)
+            if world_size > 1:
+                for block in self.structure:
+                    block_name = block['name']
+                    agent_key = f"{block_name}_agent"
+
+                    if should_update and agent_key in rl_state:
+                        # Get state dict for this agent
+                        agent_state = rl_state[agent_key]
+
+                        # Convert each tensor to a list for broadcasting
+                        broadcast_state = {}
+                        for key, value in agent_state.items():
+                            if isinstance(value, torch.Tensor):
+                                broadcast_state[key] = value
+                            else:
+                                # Handle non-tensor values (if any)
+                                broadcast_state[key] = value
+
+                        # Broadcast each tensor in the state
+                        for key, value in broadcast_state.items():
+                            if isinstance(value, torch.Tensor):
+                                dist.broadcast(value, src=0)
+                    else:
+                        # Receive broadcasted state
+                        agent = self.rl_agents[block_name]
+                        agent_state = agent.state_dict()
+
+                        # Receive each tensor in the state
+                        for key in agent_state.keys():
+                            if isinstance(agent_state[key], torch.Tensor):
+                                received_tensor = torch.zeros_like(agent_state[key])
+                                dist.broadcast(received_tensor, src=0)
+                                agent_state[key] = received_tensor
+
+                        # Load the received state
+                        agent.load_state_dict(agent_state)
         
         # Apply the synchronized selections
         for block_name, selection in selections_to_sync.items():
@@ -569,9 +640,11 @@ class RLAFS(nn.Module):
         
         Args:
             block_name: Name of the block
-            selection: List of selected channel indices
+            selection: List of selected channel indices (block-level, 0~total_channels-1)
         """
-        # Convert flat selection to per-layer selections
+        # Convert flat block-level selection to per-layer selections.
+        # 注意：selection 中保存的是“带 offset 的全局通道索引”，
+        # 需要先按 layer 范围过滤并减去 offset，才能写回每层固定长度的 indexes。
         offset = 0
         for block in self.structure:
             if block['name'] != block_name:
@@ -580,13 +653,36 @@ class RLAFS(nn.Module):
             for i, layer_info in enumerate(block['layers']):
                 layer_name = "{}_{}".format(block_name, layer_info['idx'])
                 planes = layer_info['planes']
-                
-                # Get selection for this layer
-                layer_selection = selection[offset:offset + planes]
-                
-                # Update indices
-                self.indexes[layer_name].data.copy_(torch.tensor(layer_selection).long())
-                
+
+                # 1) 取出属于该 layer 的全局通道索引
+                layer_global = [
+                    idx for idx in selection
+                    if offset <= idx < offset + planes
+                ]
+
+                # 2) 转成 layer 内部的局部索引，并去重排序
+                layer_local = sorted(set([idx - offset for idx in layer_global]))
+                layer_local = [idx for idx in layer_local if 0 <= idx < planes]
+
+                # 3) 保证长度 == planes：
+                #    - 如果不足 planes，用 [0..planes-1] 中未出现的索引补齐
+                #    - 如果多于 planes，只取前 planes 个
+                if len(layer_local) < planes:
+                    default_indices = [j for j in range(planes) if j not in layer_local]
+                    need = planes - len(layer_local)
+                    layer_local = layer_local + default_indices[:need]
+                elif len(layer_local) > planes:
+                    layer_local = layer_local[:planes]
+
+                layer_selection_tensor = torch.tensor(
+                    layer_local,
+                    dtype=torch.long,
+                    device=self.indexes[layer_name].data.device,
+                )
+
+                # Update indices（大小与 Parameter 一致，避免维度不匹配）
+                self.indexes[layer_name].data.copy_(layer_selection_tensor)
+
                 offset += planes
         
         # Synchronize across all processes in distributed training

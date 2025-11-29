@@ -128,9 +128,9 @@ net:
       stop_grad: False
 
 trainer:
-  max_epoch: 1000
-  val_freq_epoch: 5
-  print_freq_step: 20
+  max_epoch: 10 #最大训练轮数
+  val_freq_epoch: 1 #验证轮数
+  print_freq_step: 1 #打印频率
   optimizer:
     type: Adam
     kwargs:

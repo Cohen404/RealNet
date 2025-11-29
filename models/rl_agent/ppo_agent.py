@@ -91,6 +91,21 @@ class PPOAgent:
         
         # Clear memory
         self.memory.clear_memory()
+
+    # ------------------------------------------------------------------
+    # 兼容 nn.Module 接口，方便外部保存 / 加载策略参数
+    # ------------------------------------------------------------------
+    def state_dict(self):
+        """
+        返回当前策略网络的 state_dict，供外部序列化使用。
+        """
+        return self.policy.state_dict()
+
+    def load_state_dict(self, state_dict):
+        """
+        从外部提供的 state_dict 恢复策略网络参数。
+        """
+        self.policy.load_state_dict(state_dict)
         
     def save(self, path):
         """Save model parameters"""

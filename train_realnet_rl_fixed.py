@@ -202,10 +202,13 @@ def main():
     config.exp_path = os.path.dirname(args.config)
     config.checkpoints_path = os.path.join(config.exp_path, config.saver.checkpoints_dir)
     config.log_path = os.path.join(config.exp_path, config.saver.log_dir)
+    # Visualization path for evaluation_realnet.validate / export_segment_images
+    config.vis_path = os.path.join(config.exp_path, config.saver.vis_dir)
 
     if rank == 0:
         os.makedirs(config.checkpoints_path, exist_ok=True)
         os.makedirs(config.log_path, exist_ok=True)
+        os.makedirs(config.vis_path, exist_ok=True)
 
         current_time = get_current_time()
 
@@ -313,7 +316,8 @@ def main():
 
         # Validate
         if (epoch + 1) % config.trainer.val_freq_epoch == 0:
-            ret_metrics = validate(config, val_loader, model, epoch + 1, args.class_name)
+            # evaluation_realnet.validate(config, val_loader, model, class_name)
+            ret_metrics = validate(config, val_loader, model, args.class_name)
 
             # Update RL agents if enabled
             if args.use_rl and hasattr(model.module.afs, 'update_rl'):
@@ -357,7 +361,8 @@ def main():
     # Final test evaluation
     if rank == 0:
         logger.info("Running final test evaluation...")
-    test_metrics = validate(config, val_loader, model, config.trainer.max_epoch, args.class_name)
+    # evaluation_realnet.validate(config, val_loader, model, class_name)
+    test_metrics = validate(config, val_loader, model, args.class_name)
     
     if rank == 0:
         logger.info(f"Test metrics: {test_metrics}")
