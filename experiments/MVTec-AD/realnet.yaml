@@ -119,14 +119,14 @@ net:
       attention_mult: [2,4]
 
   - name: rrs
-    type: models.rrs.RRS
+    type: models.rrs.RLRRS
     prev: recon
     kwargs:
       modes: [max,mean]
       mode_numbers: [256,256] # dimensions of RRS, max=256,mean=256
       num_residual_layers: 2
       stop_grad: False
-
+      rl_number: 512
 trainer:
   max_epoch: 10 #最大训练轮数
   val_freq_epoch: 1 #验证轮数

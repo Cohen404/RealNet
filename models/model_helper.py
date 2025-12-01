@@ -78,6 +78,14 @@ class ModelHelper(nn.Module):
     def afs_module(self):
         """Get the AFS module if it exists"""
         for name, module in self.named_children():
-            if 'afs' in name.lower():
+            if "afs" in name.lower():
+                return module
+        return None
+
+    @property
+    def rrs_module(self):
+        """Get the RRS module (including RL 版本) if it exists"""
+        for name, module in self.named_children():
+            if "rrs" in name.lower():
                 return module
         return None

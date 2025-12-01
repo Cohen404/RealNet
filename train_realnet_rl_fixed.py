@@ -39,14 +39,15 @@ def parse_args():
     parser.add_argument("--config", type=str, required=True, help="Path to config file")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--use_rl", action="store_true", help="Use RL-based feature selection")
-    parser.add_argument("--rl_config", type=str, default=None, help="Path to RL config file")
+    parser.add_argument("--rl_config", type=str, default=None, help="Path to AFS RL config file")
+    parser.add_argument("--rrs_rl_config", type=str, default=None, help="Path to RRS RL config file (separate from AFS)")
     parser.add_argument("--evaluate", action="store_true", help="Run evaluation only")
     parser.add_argument("--dataset", type=str, default="mvtec", help="Dataset name")
     parser.add_argument("--class_name", type=str, default="all", help="Class name")
     return parser.parse_args()
 
-def update_config(config_path, use_rl=False, rl_config_path=None, class_name="bottle"):
-    """Update configuration with RL settings"""
+def update_config(config_path, use_rl=False, rl_config_path=None, class_name="bottle", rrs_rl_config_path=None):
+    """Update configuration with RL settings for AFS and RRS (two separate agents)"""
     with open(config_path) as f:
         config = EasyDict(yaml.load(f, Loader=yaml.FullLoader))
     
@@ -67,13 +68,13 @@ def update_config(config_path, use_rl=False, rl_config_path=None, class_name="bo
     config.net[1].kwargs['structure'] = config.structure
     
     if use_rl:
-        # Load RL config if provided
+        # ---------------- AFS RL 配置（保持与原逻辑兼容） ----------------
         if rl_config_path and os.path.exists(rl_config_path):
             with open(rl_config_path) as f:
                 rl_config = yaml.load(f, Loader=yaml.FullLoader)
             config.rl = rl_config
         else:
-            # Default RL config
+            # Default RL config for AFS
             config.rl = {
                 "ppo": {
                     "lr": 0.001,
@@ -81,31 +82,64 @@ def update_config(config_path, use_rl=False, rl_config_path=None, class_name="bo
                     "eps_clip": 0.2,
                     "k_epochs": 4,
                     "entropy_coef": 0.01,
-                    "value_coef": 0.5
+                    "value_coef": 0.5,
                 },
                 "reward": {
                     "alpha": 1.0,
                     "beta": 0.5,
-                    "gamma": 0.1
+                    "gamma": 0.1,
                 },
                 "training": {
                     "update_every_n_epochs": 5,
                     "batch_size": 32,
-                    "max_timesteps": 1000
+                    "max_timesteps": 1000,
                 },
                 "feature_selection": {
                     "min_channels": 1,
                     "max_channels_ratio": 0.8,
-                    "dynamic_inference": True
-                }
+                    "dynamic_inference": True,
+                },
             }
-        
+
         # Pass RL config to RLAFS if it's already configured
         for module in config.net:
             if module["type"] == "models.afs.RLAFS":
-                # Pass RL config to RLAFS
                 module["kwargs"] = module.get("kwargs", {})
                 module["kwargs"]["rl_config"] = config.rl
+
+        # ---------------- RRS RL 配置（与 AFS 分开） ----------------
+        if rrs_rl_config_path and os.path.exists(rrs_rl_config_path):
+            with open(rrs_rl_config_path) as f:
+                rrs_rl_config = yaml.load(f, Loader=yaml.FullLoader)
+            config.rrs_rl = rrs_rl_config
+        else:
+            # Default RL config for RRS (结构上与 AFS 一致，但为独立配置)
+            config.rrs_rl = {
+                "ppo": {
+                    "lr": 0.001,
+                    "gamma": 0.99,
+                    "eps_clip": 0.2,
+                    "k_epochs": 4,
+                },
+                "reward": {
+                    "alpha": 1.0,
+                    "beta": 0.5,
+                    "gamma": 0.1,
+                },
+                "training": {
+                    "update_every_n_epochs": 5,
+                    "init_epochs": 0,
+                },
+                "feature_selection": {
+                    "dynamic_inference": True,
+                },
+            }
+
+        # 把 RRS RL 配置传给 RLRRS 模块（若存在）
+        for module in config.net:
+            if module["type"] == "models.rrs.RLRRS":
+                module["kwargs"] = module.get("kwargs", {})
+                module["kwargs"]["rl_config"] = config.rrs_rl
     
     return config
 
@@ -123,19 +157,56 @@ def load_checkpoint(model, checkpoint_path, device, use_rl=False):
         model.load_state_dict(checkpoint)
     
     # Load RL state if available and using RL
-    if use_rl and hasattr(model.module, 'afs_module'):
-        if 'rl_state_dict' in checkpoint:
-            print("Loading RL state")
-            model.module.afs_module.load_rl_state_dict(checkpoint['rl_state_dict'])
-        
-        # Load PPO policy if available
-        if 'ppo_policy' in checkpoint and hasattr(model.module.afs_module, 'load_ppo_policy'):
-            print("Loading PPO policy for inference")
-            model.module.afs_module.load_ppo_policy(checkpoint['ppo_policy'])
-            # Enable dynamic inference if configured
-            if hasattr(model.module.afs_module, 'rl_config') and model.module.afs_module.rl_config.get('dynamic_inference', False):
-                print("Enabling dynamic inference with RL agent")
-                model.module.afs_module.enable_ppo_inference()
+    if use_rl:
+        # -------- AFS RL 状态（保持向后兼容）--------
+        if hasattr(model.module, "afs_module"):
+            afs_mod = model.module.afs_module
+            # 旧 key：rl_state_dict / ppo_policy
+            if "rl_state_dict" in checkpoint and hasattr(afs_mod, "load_rl_state_dict"):
+                print("Loading AFS RL state")
+                afs_mod.load_rl_state_dict(checkpoint["rl_state_dict"])
+
+            if "ppo_policy" in checkpoint and hasattr(afs_mod, "load_ppo_policy"):
+                print("Loading AFS PPO policy for inference")
+                afs_mod.load_ppo_policy(checkpoint["ppo_policy"])
+                if hasattr(afs_mod, "rl_config") and afs_mod.rl_config.get(
+                    "dynamic_inference", False
+                ):
+                    print("Enabling dynamic inference with AFS RL agent")
+                    afs_mod.enable_ppo_inference()
+
+            # 新 key：afs_rl_state_dict / afs_ppo_policy
+            if "afs_rl_state_dict" in checkpoint and hasattr(
+                afs_mod, "load_rl_state_dict"
+            ):
+                print("Loading AFS RL state (afs_rl_state_dict)")
+                afs_mod.load_rl_state_dict(checkpoint["afs_rl_state_dict"])
+
+            if "afs_ppo_policy" in checkpoint and hasattr(afs_mod, "load_ppo_policy"):
+                print("Loading AFS PPO policy (afs_ppo_policy)")
+                afs_mod.load_ppo_policy(checkpoint["afs_ppo_policy"])
+                if hasattr(afs_mod, "rl_config") and afs_mod.rl_config.get(
+                    "dynamic_inference", False
+                ):
+                    print("Enabling dynamic inference with AFS RL agent")
+                    afs_mod.enable_ppo_inference()
+
+        # -------- RRS RL 状态（单独智能体）--------
+        if hasattr(model.module, "rrs_module"):
+            rrs_mod = model.module.rrs_module
+            if (
+                "rrs_rl_state_dict" in checkpoint
+                and hasattr(rrs_mod, "load_rrs_rl_state_dict")
+            ):
+                print("Loading RRS RL state")
+                rrs_mod.load_rrs_rl_state_dict(checkpoint["rrs_rl_state_dict"])
+
+            if (
+                "rrs_ppo_policy" in checkpoint
+                and hasattr(rrs_mod, "load_rrs_ppo_policy")
+            ):
+                print("Loading RRS PPO policy for inference")
+                rrs_mod.load_rrs_ppo_policy(checkpoint["rrs_ppo_policy"])
     
     return checkpoint.get('epoch', 0), checkpoint.get('best_metric', 0.0)
 
@@ -190,7 +261,13 @@ def main():
     args = parse_args()
     
     # Update config
-    config = update_config(args.config, args.use_rl, args.rl_config, args.class_name)
+    config = update_config(
+        args.config,
+        args.use_rl,
+        args.rl_config,
+        args.class_name,
+        args.rrs_rl_config,
+    )
     
     # Setup distributed training
     rank, world_size = setup_distributed()
@@ -272,10 +349,18 @@ def main():
     criterion = build_criterion(config.criterion)
 
     # Enable RL if specified
-    if args.use_rl and hasattr(model.module.afs, 'enable_rl'):
-        model.module.afs.enable_rl()
-        if rank == 0:
-            logger.info("RL-based feature selection enabled")
+    if args.use_rl:
+        # AFS RL
+        if hasattr(model.module, "afs") and hasattr(model.module.afs, "enable_rl"):
+            model.module.afs.enable_rl()
+            if rank == 0:
+                logger.info("AFS RL-based feature selection enabled")
+
+        # RRS RL（如果网络中使用了 RLRRS）
+        if hasattr(model.module, "rrs") and hasattr(model.module.rrs, "enable_rl"):
+            model.module.rrs.enable_rl()
+            if rank == 0:
+                logger.info("RRS RL-based residual selection enabled")
 
     # Load checkpoint if specified
     if args.resume:
@@ -320,10 +405,22 @@ def main():
             ret_metrics = validate(config, val_loader, model, args.class_name)
 
             # Update RL agents if enabled
-            if args.use_rl and hasattr(model.module.afs, 'update_rl'):
-                model.module.afs.update_rl(ret_metrics, epoch)
-                if rank == 0:
-                    logger.info("RL agents updated")
+            if args.use_rl:
+                # AFS RL agent
+                if hasattr(model.module, "afs") and hasattr(
+                    model.module.afs, "update_rl"
+                ):
+                    model.module.afs.update_rl(ret_metrics, epoch)
+                    if rank == 0:
+                        logger.info("AFS RL agents updated")
+
+                # RRS RL agent
+                if hasattr(model.module, "rrs_module") and hasattr(
+                    model.module.rrs_module, "update_rl"
+                ):
+                    model.module.rrs_module.update_rl(ret_metrics, epoch)
+                    if rank == 0:
+                        logger.info("RRS RL agent updated")
 
             if rank == 0:
                 ret_key_metric = np.mean([ret_metrics[key] for key in ret_metrics if key.find(key_metric) != -1])
@@ -347,12 +444,34 @@ def main():
                     }
                     
                     # Save RL state if enabled
-                    if args.use_rl and hasattr(model.module.afs, 'get_rl_state_dict'):
-                        checkpoint_data["rl_state_dict"] = model.module.afs.get_rl_state_dict()
-                        
-                        # Also save PPO policy for inference
-                        if hasattr(model.module.afs, 'save_ppo_policy'):
-                            checkpoint_data["ppo_policy"] = model.module.afs.save_ppo_policy()
+                    if args.use_rl:
+                        # AFS RL
+                        if hasattr(model.module, "afs") and hasattr(
+                            model.module.afs, "get_rl_state_dict"
+                        ):
+                            checkpoint_data["afs_rl_state_dict"] = (
+                                model.module.afs.get_rl_state_dict()
+                            )
+
+                            if hasattr(model.module.afs, "save_ppo_policy"):
+                                checkpoint_data["afs_ppo_policy"] = (
+                                    model.module.afs.save_ppo_policy()
+                                )
+
+                        # RRS RL（单独智能体，保存的是“策略”而不是块编号）
+                        if hasattr(model.module, "rrs_module") and hasattr(
+                            model.module.rrs_module, "get_rrs_rl_state_dict"
+                        ):
+                            checkpoint_data["rrs_rl_state_dict"] = (
+                                model.module.rrs_module.get_rrs_rl_state_dict()
+                            )
+
+                        if hasattr(model.module, "rrs_module") and hasattr(
+                            model.module.rrs_module, "save_rrs_ppo_policy"
+                        ):
+                            checkpoint_data["rrs_ppo_policy"] = (
+                                model.module.rrs_module.save_rrs_ppo_policy()
+                            )
                     
                     save_checkpoint(checkpoint_data, config, args.class_name)
         

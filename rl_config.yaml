@@ -17,7 +17,8 @@ reward:
   
 # RL training parameters
 training:
-  update_every_n_epochs: 5
+  init_epochs: 0            # 前多少个 epoch 不更新 AFS RL（与 RRS 保持一致）
+  update_every_n_epochs: 5  # 每多少个 epoch 更新一次 AFS RL（与 RRS 保持一致）
   batch_size: 32
   max_timesteps: 1000
   

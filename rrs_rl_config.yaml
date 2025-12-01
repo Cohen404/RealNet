@@ -1,0 +1,25 @@
+## RRS 专用 RL 配置（与 AFS 使用的 rl_config.yaml 区分开）
+
+# PPO 超参数
+ppo:
+  lr: 0.001
+  gamma: 0.99
+  eps_clip: 0.2
+  k_epochs: 4
+
+# 奖励函数权重（与 AFS 保持一致的含义）
+reward:
+  alpha: 1.0   # 像素级 AUC 提升权重
+  beta: 0.5    # 图片级 AUC 提升权重
+  gamma: 0.1   # 目标块数偏差二次惩罚权重
+
+# 训练相关
+training:
+  init_epochs: 0              # 前多少个 epoch 不更新 RRS RL
+  update_every_n_epochs: 5    # 每多少个 epoch 更新一次 RRS RL
+
+# 特征块选择相关
+feature_selection:
+  dynamic_inference: true     # 推理阶段是否启用动态块选择
+
+
