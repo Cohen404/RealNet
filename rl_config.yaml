@@ -2,23 +2,27 @@
 
 # PPO hyperparameters
 ppo:
-  lr: 0.001
+  lr: 0.0005
   gamma: 0.99
-  eps_clip: 0.2
+  eps_clip: 0.1
   k_epochs: 4
-  entropy_coef: 0.01
+  entropy_coef: 0.02
   value_coef: 0.5
+  lr_scheduler:
+    type: 'step'
+    step_size: 200
+    gamma: 0.5
   
 # Reward function weights
 reward:
-  alpha: 1.0  # Weight for PixelAUC improvement
-  beta: 0.5   # Weight for ImageAUC improvement
-  gamma: 0.1  # Weight for channel selection penalty
+  alpha: 0.8  # Weight for PixelAUC improvement
+  beta: 0.8   # Weight for ImageAUC improvement
+  gamma: 0.2  # Weight for channel selection penalty
   
 # RL training parameters
 training:
-  init_epochs: 0            # 前多少个 epoch 不更新 AFS RL（与 RRS 保持一致）
-  update_every_n_epochs: 5  # 每多少个 epoch 更新一次 AFS RL（与 RRS 保持一致）
+  init_epochs: 50            # 前多少个 epoch 不更新 AFS RL（与 RRS 保持一致）
+  update_every_n_epochs: 10  # 每多少个 epoch 更新一次 AFS RL（与 RRS 保持一致）
   batch_size: 32
   max_timesteps: 1000
   

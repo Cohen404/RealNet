@@ -345,6 +345,10 @@ def main():
 
     best_metric = 0
     last_epoch = 0
+    
+    # Early stopping parameters
+    patience = 50
+    no_improve_count = 0
 
     criterion = build_criterion(config.criterion)
 
@@ -430,6 +434,9 @@ def main():
 
                 if is_best:
                     best_record = {key.replace("mean", 'best') : ret_metrics[key] for key in ret_metrics if key.find("mean") != -1}
+                    no_improve_count = 0
+                else:
+                    no_improve_count += 1
 
                 ret_metrics.update(best_record)
                 log_metrics(ret_metrics, config.evaluator.metrics, "realnet_logger_{}".format(args.class_name))
@@ -476,11 +483,53 @@ def main():
                     save_checkpoint(checkpoint_data, config, args.class_name)
         
         dist.barrier()
+        
+        # Early stopping check
+        if rank == 0 and no_improve_count >= patience:
+            logger.info(f"Early stopping triggered after {epoch+1} epochs (no improvement for {patience} epochs)")
+            break
 
-    # Final test evaluation
+    # Final test evaluation - load best model first
     if rank == 0:
         logger.info("Running final test evaluation...")
-    # evaluation_realnet.validate(config, val_loader, model, class_name)
+        logger.info("Loading best model for final evaluation...")
+        
+        # Load best checkpoint
+        best_checkpoint_path = os.path.join(
+            config.checkpoints_path, 
+            f"best_{args.class_name}.pth"
+        )
+        
+        if os.path.exists(best_checkpoint_path):
+            checkpoint = torch.load(best_checkpoint_path, map_location='cuda')
+            model.module.load_state_dict(checkpoint['state_dict'])
+            
+            # Load RL states if available
+            if args.use_rl:
+                if 'afs_rl_state_dict' in checkpoint and hasattr(model.module, "afs") and hasattr(model.module.afs, "load_rl_state_dict"):
+                    model.module.afs.load_rl_state_dict(checkpoint['afs_rl_state_dict'])
+                    if rank == 0:
+                        logger.info("Loaded AFS RL state")
+                
+                if 'rrs_rl_state_dict' in checkpoint and hasattr(model.module, "rrs_module") and hasattr(model.module.rrs_module, "load_rrs_rl_state_dict"):
+                    model.module.rrs_module.load_rrs_rl_state_dict(checkpoint['rrs_rl_state_dict'])
+                    if rank == 0:
+                        logger.info("Loaded RRS RL state")
+                
+                if 'afs_ppo_policy' in checkpoint and hasattr(model.module, "afs") and hasattr(model.module.afs, "load_ppo_policy"):
+                    model.module.afs.load_ppo_policy(checkpoint['afs_ppo_policy'])
+                    if rank == 0:
+                        logger.info("Loaded AFS PPO policy")
+                
+                if 'rrs_ppo_policy' in checkpoint and hasattr(model.module, "rrs_module") and hasattr(model.module.rrs_module, "load_rrs_ppo_policy"):
+                    model.module.rrs_module.load_rrs_ppo_policy(checkpoint['rrs_ppo_policy'])
+                    if rank == 0:
+                        logger.info("Loaded RRS PPO policy")
+            
+            logger.info(f"Loaded best model from epoch {checkpoint.get('epoch', 'unknown')} with metric {checkpoint.get('best_metric', 'unknown'):.4f}")
+        else:
+            logger.warning(f"Best checkpoint not found at {best_checkpoint_path}, using current model")
+    
     test_metrics = validate(config, val_loader, model, args.class_name)
     
     if rank == 0:
