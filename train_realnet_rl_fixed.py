@@ -44,6 +44,7 @@ def parse_args():
     parser.add_argument("--evaluate", action="store_true", help="Run evaluation only")
     parser.add_argument("--dataset", type=str, default="mvtec", help="Dataset name")
     parser.add_argument("--class_name", type=str, default="all", help="Class name")
+    parser.add_argument("--local_rank", default=-1, type=int)
     return parser.parse_args()
 
 def update_config(config_path, use_rl=False, rl_config_path=None, class_name="bottle", rrs_rl_config_path=None):
