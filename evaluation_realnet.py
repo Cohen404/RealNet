@@ -79,8 +79,10 @@ def main():
     config.exp_path = os.path.dirname(args.config)
 
     args.checkpoints_folder = os.path.join(config.exp_path, config.saver.checkpoints_dir,args.class_name)
-
-    args.model_path=os.path.join(args.checkpoints_folder,"ckpt_best.pth.tar")
+    import glob
+    # 找最新的 ckpt_best 文件（兼容带日期的新格式和旧格式 ckpt_best.pth.tar）
+    best_files = sorted(glob.glob(os.path.join(args.checkpoints_folder, "ckpt_best*.pth.tar")))
+    args.model_path = best_files[-1] if best_files else os.path.join(args.checkpoints_folder, "ckpt_best.pth.tar")
 
     config=update_config(config,args)
     set_seed(config.random_seed)

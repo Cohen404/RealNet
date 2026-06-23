@@ -156,15 +156,16 @@ class AverageMeter(object):
 
 
 
-def save_checkpoint(state, config, class_name=None,epoch=None):
+def save_checkpoint(state, config, class_name=None, epoch=None):
     if class_name:
-        folder = os.path.join(config.checkpoints_path,class_name)
+        folder = os.path.join(config.checkpoints_path, class_name)
     else:
         folder = os.path.join(config.checkpoints_path)
 
-    os.makedirs(folder,exist_ok=True)
+    os.makedirs(folder, exist_ok=True)
+    date_str = datetime.now().strftime("%m%d_%H%M")
     if epoch:
-        torch.save(state, os.path.join(folder, f"ckpt_{epoch}.pth.tar"))
+        torch.save(state, os.path.join(folder, f"ckpt_ep{epoch}_{date_str}.pth.tar"))
     else:
-        torch.save(state, os.path.join(folder, "ckpt_best.pth.tar"))
+        torch.save(state, os.path.join(folder, f"ckpt_best_{date_str}.pth.tar"))
 
